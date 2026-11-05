@@ -96,12 +96,12 @@ fun ZonePopup(selection: Selection, onClose: () -> Unit) {
                 ) {
                     Column(Modifier.weight(1f).padding(top = 8.dp)) {
                         Text(
-                            header(selection.zones.size),
+                            selection.title ?: header(selection.zones.size),
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.primary,
                         )
-                        Text(
+                        if (selection.title == null) Text(
                             String.format(Locale.US, "%.5f, %.5f", selection.lat, selection.lon),
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -151,7 +151,7 @@ private fun header(n: Int) = when (n) {
 }
 
 @Composable
-private fun ColorDot(hex: String) {
+internal fun ColorDot(hex: String) {
     Box(
         Modifier
             .size(10.dp)

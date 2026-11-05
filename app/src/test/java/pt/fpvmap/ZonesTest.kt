@@ -63,4 +63,11 @@ class ZonesTest {
         )
         assertEquals("MON, 09:00 UTC – 17:00 UTC", formatSchedule(Schedule(listOf("MON"), "09:00:00Z", "17:00:00Z", null, null)))
     }
+
+    @Test
+    fun matchesZonesByIdThenName() {
+        assertEquals("95007UA", matchZones(data.zones, "95007").first().id)
+        assertTrue(matchZones(data.zones, "tejo").all { it.name.contains("Tejo", ignoreCase = true) })
+        assertTrue(matchZones(data.zones, "t").isEmpty())
+    }
 }

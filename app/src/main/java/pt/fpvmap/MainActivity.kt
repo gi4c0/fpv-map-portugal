@@ -13,6 +13,14 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.width
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalWindowInfo
+import org.maplibre.android.camera.CameraUpdateFactory
+import org.maplibre.android.geometry.LatLngBounds
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.navigationBars
@@ -37,6 +45,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
@@ -84,8 +93,11 @@ class MainActivity : ComponentActivity() {
 private const val BASEMAP = "https://tiles.openfreemap.org/styles/liberty"
 private val PORTUGAL = LatLng(39.6, -8.0)
 
-/** Tap result: the point and the zones covering it (possibly none). */
-data class Selection(val lat: Double, val lon: Double, val zones: List<Zone>)
+/**
+ * Popup content: zones covering a point (map tap or place search), or a single zone
+ * picked from search ([title] set, no point marker).
+ */
+data class Selection(val lat: Double, val lon: Double, val zones: List<Zone>, val title: String? = null)
 
 @Composable
 private fun MapScreen() {
@@ -129,6 +141,49 @@ private fun MapScreen() {
         data?.zones.orEmpty().filter { it.status(now) != ZoneStatus.EXPIRED }
     }
     val currentZones by rememberUpdatedState(visibleZones)
+    val density = LocalDensity.current
+    val focusManager = LocalFocusManager.current
+    fun zonesAt(lat: Double, lon: Double) =
+        currentZones.filter { it.contains(lon, lat) }.sortedBy { severity(it.restriction) }
+
+    val windowSize = LocalWindowInfo.current.containerSize
+    /** Camera padding (l, t, r, b px) leaving the part of the map not under search bar and popup. */
+    fun popupFreePadding(): List<Int> = with(density) {
+        val w = windowSize.width
+        val h = windowSize.height
+        val m = 32.dp.roundToPx()
+        if (w > h) listOf(m, m, minOf(440.dp.roundToPx(), (w * 0.55f).toInt()) + m, m)
+        else listOf(m, 160.dp.roundToPx(), m, (h * 0.62f).toInt() + m)
+    }
+
+    fun onSearchPick(r: SearchResult) {
+        val m = map ?: return
+        if (m.locationComponent.isLocationComponentActivated) m.locationComponent.cameraMode = CameraMode.NONE
+        when (r) {
+            is SearchResult.Place -> {
+                val (l, t, rt, b) = popupFreePadding()
+                m.animateCamera(
+                    CameraUpdateFactory.newCameraPosition(
+                        CameraPosition.Builder().target(LatLng(r.lat, r.lon)).zoom(13.0)
+                            .padding(l.toDouble(), t.toDouble(), rt.toDouble(), b.toDouble()).build()
+                    ),
+                    800,
+                )
+                selection = Selection(r.lat, r.lon, zonesAt(r.lat, r.lon))
+            }
+            is SearchResult.ZoneMatch -> {
+                val b = LatLngBounds.Builder()
+                r.zone.polygons.forEach { rings ->
+                    val ring = rings[0]
+                    for (i in 0 until ring.size / 2) b.include(LatLng(ring[i * 2 + 1], ring[i * 2]))
+                }
+                val bounds = b.build()
+                val (l, t, rt, bt) = popupFreePadding()
+                m.animateCamera(CameraUpdateFactory.newLatLngBounds(bounds, l, t, rt, bt), 800)
+                selection = Selection(bounds.center.latitude, bounds.center.longitude, listOf(r.zone), title = "Zone ${r.zone.id}")
+            }
+        }
+    }
 
     LaunchedEffect(style, visibleZones) {
         style?.getSourceAs<GeoJsonSource>(SRC_ZONES)?.setGeoJson(zonesToGeoJson(visibleZones))
@@ -140,13 +195,12 @@ private fun MapScreen() {
     LaunchedEffect(style, selection) {
         val sel = selection
         style?.getSourceAs<GeoJsonSource>(SRC_TAP)?.setGeoJson(
-            if (sel == null) FeatureCollection.fromFeatures(emptyList())
+            if (sel == null || sel.title != null) FeatureCollection.fromFeatures(emptyList())
             else FeatureCollection.fromFeature(Feature.fromGeometry(Point.fromLngLat(sel.lon, sel.lat)))
         )
     }
 
     // Keep MapLibre's own controls clear of the system bars.
-    val density = LocalDensity.current
     val top = WindowInsets.statusBars.getTop(density)
     val bottom = WindowInsets.navigationBars.getBottom(density)
     LaunchedEffect(map, top, bottom) {
@@ -169,22 +223,11 @@ private fun MapScreen() {
                     style = s
                 }
                 m.addOnMapClickListener { p ->
-                    val hits = currentZones
-                        .filter { it.contains(p.longitude, p.latitude) }
-                        .sortedBy { severity(it.restriction) }
-                    selection = Selection(p.latitude, p.longitude, hits)
+                    focusManager.clearFocus()
+                    selection = Selection(p.latitude, p.longitude, zonesAt(p.latitude, p.longitude))
                     true
                 }
             },
-        )
-
-        StatusChip(
-            text = dataStatus,
-            onClick = { refresh() },
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(12.dp),
         )
 
         if (hasLocation) {
@@ -200,6 +243,30 @@ private fun MapScreen() {
         selection?.let { sel ->
             ZonePopup(selection = sel, onClose = { selection = null })
         }
+
+        // Drawn after the popup so search results stay on top of it.
+        BoxWithConstraints(
+            Modifier
+                .fillMaxSize()
+                .windowInsetsPadding(WindowInsets.safeDrawing)
+                .padding(12.dp)
+        ) {
+            // Window shape, not this box: the keyboard shrinks the box and would flip it to landscape.
+            val config = LocalConfiguration.current
+            val landscape = config.screenWidthDp > config.screenHeightDp
+            Column(
+                Modifier.width(if (landscape) minOf(420.dp, maxWidth * 0.4f) else minOf(560.dp, maxWidth)),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                SearchBar(
+                    zones = visibleZones,
+                    onPick = ::onSearchPick,
+                    onFocus = { selection = null },
+                )
+                StatusChip(text = dataStatus, onClick = { refresh() })
+            }
+        }
+
     }
 }
 
@@ -305,6 +372,7 @@ private fun MapLibreMap.enableLocation(context: Context, style: Style) {
 private fun MapLibreMap.trackUser() {
     val lc = locationComponent
     if (!lc.isLocationComponentActivated) return
+    moveCamera(CameraUpdateFactory.paddingTo(0.0, 0.0, 0.0, 0.0)) // drop search framing padding
     // Transition variant: applies the zoom once the first fix arrives, not only if tracking is already live.
     lc.setCameraMode(CameraMode.TRACKING, 750L, 13.0, null, null, null)
 }
