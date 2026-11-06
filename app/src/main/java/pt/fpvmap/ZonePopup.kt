@@ -110,35 +110,34 @@ fun ZonePopup(selection: Selection, onClose: () -> Unit) {
                     IconButton(onClick = onClose) { Text("✕", style = MaterialTheme.typography.titleMedium) }
                 }
 
+                val contentModifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
                 if (selection.zones.isEmpty()) {
-                    Text(
-                        "No UAS geographical zone covers this point. National rules still apply.",
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
+                    SummaryDetails(selection.zones, contentModifier)
                     return@Column
                 }
 
+                // Tab 0 is the summary, tab i + 1 is selection.zones[i].
                 LazyRow(
                     contentPadding = PaddingValues(horizontal = 16.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
+                    item {
+                        FilterChip(selected = tab == 0, onClick = { tab = 0 }, label = { Text("Summary") })
+                    }
                     itemsIndexed(selection.zones) { i, z ->
                         FilterChip(
-                            selected = i == tab,
-                            onClick = { tab = i },
+                            selected = i + 1 == tab,
+                            onClick = { tab = i + 1 },
                             label = { Text(z.id) },
                             leadingIcon = { ColorDot(z.color) },
                         )
                     }
                 }
                 HorizontalDivider(Modifier.padding(top = 4.dp))
-                ZoneDetails(
-                    zone = selection.zones[tab.coerceIn(selection.zones.indices)],
-                    modifier = Modifier
-                        .verticalScroll(rememberScrollState())
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                )
+                if (tab == 0) SummaryDetails(selection.zones, contentModifier)
+                else ZoneDetails(selection.zones[(tab - 1).coerceIn(selection.zones.indices)], contentModifier)
             }
         }
     }
@@ -157,6 +156,109 @@ internal fun ColorDot(hex: String) {
             .size(10.dp)
             .background(Color(AndroidColor.parseColor(hex)), CircleShape)
     )
+}
+
+/** What a pilot needs at a point: the strictest active rule and the zones that impose it. */
+data class Summary(
+    /** Strictest active restriction, null if no active zone covers the point. */
+    val restriction: String?,
+    /** Active zones with that restriction. */
+    val governing: List<Zone>,
+    /** Not yet active zones stricter than [restriction]. */
+    val upcoming: List<Zone>,
+    /** Remaining active zones (less restrictive). */
+    val others: Int,
+)
+
+fun summarize(zones: List<Zone>, now: Instant): Summary {
+    val active = zones.filter { it.status(now) == ZoneStatus.ACTIVE }
+    val strictest = active.minOfOrNull { severity(it.restriction) } ?: Int.MAX_VALUE
+    val governing = active.filter { severity(it.restriction) == strictest }
+    return Summary(
+        restriction = governing.firstOrNull()?.restriction,
+        governing = governing,
+        upcoming = zones.filter { it.status(now) == ZoneStatus.UPCOMING && severity(it.restriction) < strictest },
+        others = active.size - governing.size,
+    )
+}
+
+fun verdictText(restriction: String?): String = when (severity(restriction ?: "")) {
+    0 -> "Flying prohibited"
+    1 -> "Authorisation required"
+    2 -> "Allowed with conditions"
+    else -> "Allowed"
+}
+
+private fun verdictColor(restriction: String?) = when (severity(restriction ?: "")) {
+    0 -> Color(0xFFC62828)
+    1 -> Color(0xFFEF6C00)
+    2 -> Color(0xFFF9A825)
+    else -> Color(0xFF2E7D32)
+}
+
+@Composable
+private fun SummaryDetails(zones: List<Zone>, modifier: Modifier = Modifier) {
+    val now = Instant.now()
+    val s = summarize(zones, now)
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(
+            verdictText(s.restriction),
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(verdictColor(s.restriction), MaterialTheme.shapes.small)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            color = Color.White,
+        )
+        if (s.restriction == null) Text(
+            "No active UAS geographical zone here. Open category rules apply: max 120 m AGL, keep the drone in VLOS.",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+
+        s.governing.forEach { z -> RuleBlock(z) }
+
+        s.upcoming.forEach { z ->
+            Text(
+                "From ${formatInstant(z.applicability.mapNotNull { it.start }.minOrNull())}: " +
+                    "${verdictText(z.restriction).lowercase()} (${z.id})",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+                color = verdictColor(z.restriction),
+            )
+        }
+
+        if (s.others > 0) Text(
+            "${s.others} less restrictive zone${if (s.others == 1) "" else "s"} also here, see the other tabs.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(4.dp))
+    }
+}
+
+/** One governing zone: its rule, vertical limits, time limits, and whom to ask. */
+@Composable
+private fun RuleBlock(z: Zone) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            ColorDot(z.color)
+            Text("${z.id} · ${z.name}", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+        }
+        z.message?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+        Lines(
+            "Applies" to "${fmtNum(z.layer.lower)}–${fmtNum(z.layer.upper)} ${z.layer.uom} ${z.layer.upperReference}",
+            // Permanent zones still carry an end date (feed validity); only show near ends, e.g. NOTAMs.
+            "Until" to z.end?.takeIf { it < Instant.now().plus(Duration.ofDays(30)) }?.let(::formatInstant),
+            "When" to z.applicability.flatMap { it.schedule }.takeIf { it.isNotEmpty() }
+                ?.joinToString("\n", transform = ::formatSchedule),
+        )
+        if (severity(z.restriction) <= 1) z.authorities.filter { it.purpose == "AUTHORIZATION" }.forEach { a ->
+            Lines("Ask" to listOfNotNull(a.name, a.intervalBefore?.let(::formatNotice)).joinToString(", "))
+            a.email?.let { LinkLine("Email", it, "mailto:$it") }
+            a.phone?.let { val p = phone(it); LinkLine("Phone", p, "tel:${p.replace(" ", "")}") }
+        }
+    }
 }
 
 @Composable

@@ -70,4 +70,23 @@ class ZonesTest {
         assertTrue(matchZones(data.zones, "tejo").all { it.name.contains("Tejo", ignoreCase = true) })
         assertTrue(matchZones(data.zones, "t").isEmpty())
     }
+
+    @Test
+    fun summaryPicksStrictestActiveZone() {
+        val now = Instant.parse("2026-06-01T00:00:00Z")
+        val base = zone("95007UA").copy(applicability = emptyList())
+        val allowed = base.copy(id = "A", restriction = "NO_RESTRICTION")
+        val auth = base.copy(id = "B", restriction = "REQ_AUTHORIZATION")
+        val banLater = base.copy(
+            id = "C", restriction = "PROHIBITED",
+            applicability = listOf(Applicability(Instant.parse("2026-07-01T00:00:00Z"), null, emptyList())),
+        )
+        val s = summarize(listOf(allowed, auth, banLater), now)
+        assertEquals("REQ_AUTHORIZATION", s.restriction)
+        assertEquals(listOf("B"), s.governing.map { it.id })
+        assertEquals(listOf("C"), s.upcoming.map { it.id })
+        assertEquals(1, s.others)
+        assertEquals("Authorisation required", verdictText(s.restriction))
+        assertEquals("Allowed", verdictText(summarize(emptyList(), now).restriction))
+    }
 }
